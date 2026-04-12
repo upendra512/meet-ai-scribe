@@ -1,0 +1,17 @@
+{
+  "name": "meet-scribe",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "apps/bot"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=apps/web",
+    "dev:bot": "npm run dev --workspace=apps/bot",
+    "dev": "concurrently \"npm run dev:bot\" \"npm run dev:web\"",
+    "build": "npm run build --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
