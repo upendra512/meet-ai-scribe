@@ -10,7 +10,8 @@ async function getUserFromRequest(req: NextRequest) {
     const adminAuth = getAdminAuth();
     const decoded = await adminAuth.verifyIdToken(token);
     return decoded;
-  } catch {
+  } catch (e) {
+    console.error('[auth] verifyIdToken failed:', e);
     return null;
   }
 }
@@ -34,6 +35,7 @@ export async function GET(req: NextRequest) {
 
 // POST /api/meetings — create meeting + call bot/start
 export async function POST(req: NextRequest) {
+  try {
   const user = await getUserFromRequest(req);
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
@@ -98,4 +100,9 @@ export async function POST(req: NextRequest) {
   }
 
   return NextResponse.json({ meetingId, success: true });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[api/meetings] Unhandled error:', msg);
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
 }
