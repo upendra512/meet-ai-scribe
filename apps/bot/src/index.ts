@@ -28,7 +28,7 @@ app.use(cors({
 app.use(express.json());
 
 // Health check (no auth required)
-app.get('/health', (_, res) => {
+app.get('/health', (_req: import('express').Request, res: import('express').Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
