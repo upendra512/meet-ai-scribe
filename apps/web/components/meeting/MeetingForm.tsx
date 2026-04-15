@@ -43,12 +43,12 @@ export function MeetingForm() {
         body: JSON.stringify({ meetUrl: url.trim() }),
       });
 
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Failed to start bot');
+        throw new Error(data.error || `Server error ${res.status}`);
       }
 
-      const { meetingId } = await res.json();
+      const { meetingId } = data;
       toast.success('Bot is joining the meeting!');
       router.push(`/meeting/${meetingId}`);
     } catch (err: unknown) {

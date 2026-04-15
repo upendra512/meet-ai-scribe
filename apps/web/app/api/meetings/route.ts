@@ -86,21 +86,15 @@ export async function POST(req: NextRequest) {
       const { botId } = await botRes.json();
       await ref.update({ botId });
     } else {
-      console.error('[api/meetings] Bot start failed:', await botRes.text());
+      const errText = await botRes.text();
+      console.error('[api/meetings] Bot start failed:', errText);
+      // Don't fail the whole request — let the meeting be created, bot retries can happen
       await ref.update({ status: 'error' });
-      return NextResponse.json(
-        { error: 'Bot service failed to start. Is it running?' },
-        { status: 502 }
-      );
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     console.error('[api/meetings] Cannot reach bot service:', msg);
     await ref.update({ status: 'error' });
-    return NextResponse.json(
-      { error: 'Could not reach bot service. Check BOT_SERVICE_URL.' },
-      { status: 502 }
-    );
   }
 
   return NextResponse.json({ meetingId, success: true });
