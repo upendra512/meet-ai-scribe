@@ -85,6 +85,9 @@ async function runBot(session: BotSession, meetUrl: string, io: SocketServer): P
       '--disable-blink-features=AutomationControlled',
       '--disable-features=IsolateOrigins,site-per-process',
       '--window-size=1280,720',
+      '--js-flags=--max-old-space-size=256',
+      '--disable-software-rasterizer',
+      '--disable-web-security',
     ],
     defaultViewport: { width: 1280, height: 720 },
   });
