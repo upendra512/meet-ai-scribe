@@ -11,7 +11,16 @@ function getAdminApp(): App {
     return adminApp;
   }
 
-  const privateKey = process.env.FIREBASE_ADMIN_PRIVATE_KEY?.replace(/\\n/g, '\n');
+  // Support both base64-encoded and raw key formats
+  const rawKey = process.env.FIREBASE_ADMIN_PRIVATE_KEY ?? '';
+  let privateKey: string;
+  if (rawKey.startsWith('-----BEGIN')) {
+    // Already a real PEM key — just normalize escaped newlines if any
+    privateKey = rawKey.replace(/\\n/g, '\n');
+  } else {
+    // Stored as base64 on Vercel to avoid newline corruption
+    privateKey = Buffer.from(rawKey, 'base64').toString('utf8');
+  }
 
   adminApp = initializeApp({
     credential: cert({
