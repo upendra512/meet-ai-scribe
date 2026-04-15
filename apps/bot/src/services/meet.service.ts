@@ -17,13 +17,25 @@ export interface BotSession {
   meetingEndPoller: ReturnType<typeof setInterval> | null;
 }
 
-// Map of meetingId → BotSession
 const sessions = new Map<string, BotSession>();
+
+function wait(ms: number) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// Safe page.evaluate that handles detached frames
+async function safeEval<T>(page: Page, fn: () => T): Promise<T | null> {
+  try {
+    if (page.isClosed()) return null;
+    return await page.evaluate(fn);
+  } catch {
+    return null;
+  }
+}
 
 function emitStatus(io: SocketServer, meetingId: string, status: BotStatus, message?: string) {
   const session = sessions.get(meetingId);
   if (session) session.status = status;
-
   io.to(meetingId).emit(SOCKET_EVENTS.BOT_STATUS, { meetingId, status, message });
   console.log(`[bot:${meetingId}] status → ${status}${message ? ': ' + message : ''}`);
 }
@@ -50,7 +62,6 @@ export async function startBot(
   };
   sessions.set(meetingId, session);
 
-  // Run bot asynchronously so we return the botId immediately
   runBot(session, meetUrl, io).catch((err) => {
     console.error(`[bot:${meetingId}] Fatal error:`, err);
     emitStatus(io, meetingId, 'error', err.message);
@@ -64,7 +75,6 @@ async function runBot(session: BotSession, meetUrl: string, io: SocketServer): P
   const { meetingId } = session;
   emitStatus(io, meetingId, 'joining', 'Launching browser...');
 
-  // --- Launch Browser ---
   const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
   session.browser = await puppeteer.launch({
@@ -75,8 +85,6 @@ async function runBot(session: BotSession, meetUrl: string, io: SocketServer): P
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--disable-extensions',
-      '--disable-background-networking',
       '--no-first-run',
       '--no-zygote',
       '--single-process',
@@ -86,201 +94,151 @@ async function runBot(session: BotSession, meetUrl: string, io: SocketServer): P
       '--disable-features=IsolateOrigins,site-per-process',
       '--window-size=1280,720',
       '--js-flags=--max-old-space-size=256',
-      '--disable-software-rasterizer',
-      '--disable-web-security',
     ],
     defaultViewport: { width: 1280, height: 720 },
   });
 
   const context = session.browser.defaultBrowserContext();
-
-  // Grant media permissions for Google Meet domain
-  await context.overridePermissions('https://meet.google.com', [
-    'camera',
-    'microphone',
-    'notifications',
-  ]);
+  await context.overridePermissions('https://meet.google.com', ['camera', 'microphone', 'notifications']);
 
   session.page = await session.browser.newPage();
   const page = session.page;
 
-  // Hide automation fingerprints
+  // Hide automation
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    // @ts-ignore
-    delete navigator.__proto__.webdriver;
   });
 
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
   );
 
-  // Block unnecessary resources to speed up loading
   await page.setRequestInterception(true);
   page.on('request', (req) => {
-    const blocked = ['font', 'media'];
-    if (blocked.includes(req.resourceType())) {
-      req.abort();
-    } else {
-      req.continue();
-    }
+    if (['font', 'media'].includes(req.resourceType())) req.abort();
+    else req.continue();
   });
 
-  // --- Navigate to Meet ---
+  // --- Navigate ---
   emitStatus(io, meetingId, 'joining', 'Navigating to Google Meet...');
   await page.goto(meetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await wait(3000);
 
-  // Dismiss any cookie/consent banners
-  await page.evaluate(() => {
-    const selectors = [
-      '[data-mdc-dialog-action="accept"]',
-      '[aria-label="Accept all"]',
-      'button[jsname="higCR"]',
-    ];
+  // --- Dismiss cookie banners ---
+  await safeEval(page, () => {
+    const selectors = ['[data-mdc-dialog-action="accept"]', '[aria-label="Accept all"]', 'button[jsname="higCR"]'];
     for (const sel of selectors) {
       const el = document.querySelector(sel) as HTMLElement | null;
       if (el) { el.click(); return; }
     }
   });
+  await wait(1000);
 
-  await new Promise(r => setTimeout(r, 2000));
-
-  // --- Handle Name Input (guest join) ---
+  // --- Enter name ---
   emitStatus(io, meetingId, 'joining', 'Entering bot name...');
-
-  const nameInputSelectors = [
+  const nameSelectors = [
     'input[placeholder="Your name"]',
     'input[aria-label="Your name"]',
     'input[jsname="YPqjbf"]',
-    '#c13 input',
   ];
-
-  let nameInputFound = false;
-  for (const sel of nameInputSelectors) {
+  for (const sel of nameSelectors) {
     try {
-      await page.waitForSelector(sel, { timeout: 8000 });
+      await page.waitForSelector(sel, { timeout: 6000 });
       await page.click(sel, { clickCount: 3 });
-      await page.type(sel, 'MeetScribe Bot', { delay: 60 });
-      nameInputFound = true;
+      await page.type(sel, 'MeetScribe Bot', { delay: 50 });
       break;
-    } catch {
-      // Try next selector
-    }
+    } catch { /* try next */ }
   }
 
-  if (!nameInputFound) {
-    console.warn(`[bot:${meetingId}] Could not find name input — user may already be signed in`);
-  }
+  await wait(500);
 
-  // --- Mute mic + camera before joining ---
-  await page.evaluate(() => {
-    // Try to click mute buttons if they exist in the pre-join screen
-    const selectors = [
-      '[data-is-muted="false"][aria-label*="microphone"]',
-      '[data-is-muted="false"][aria-label*="camera"]',
-      '[data-promo-anchor-id="mute-audio"]',
-      '[data-promo-anchor-id="mute-video"]',
-    ];
-    for (const sel of selectors) {
-      const el = document.querySelector(sel) as HTMLElement | null;
-      if (el) el.click();
-    }
-  });
-
-  await new Promise(r => setTimeout(r, 500));
-
-  // --- Click Join Button ---
+  // --- Click Join ---
   emitStatus(io, meetingId, 'waiting', 'Requesting to join meeting...');
 
-  const joinButtonSelectors = [
-    '[data-idom-class="nCP5yc AjY5Ib YxyAuT"]',
-    'button[jsname="Qx7uuf"]',
-    'button[data-idom-class*="AjY5Ib"]',
-  ];
-
+  // Try specific selectors first
   let joined = false;
-  for (const sel of joinButtonSelectors) {
-    const btn = await page.$(sel);
-    if (btn) {
-      await btn.click();
-      joined = true;
-      break;
-    }
+  const joinSelectors = ['button[jsname="Qx7uuf"]', '[data-idom-class*="AjY5Ib"]'];
+  for (const sel of joinSelectors) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) { await btn.click(); joined = true; break; }
+    } catch { /* try next */ }
   }
 
+  // Fallback: find any button with Join text
   if (!joined) {
-    // Generic fallback: find button with "Join" text
-    joined = await page.evaluate(() => {
+    joined = await safeEval(page, () => {
       const buttons = [...document.querySelectorAll('button')];
-      const joinBtn = buttons.find(
-        b => b.innerText.includes('Join now') || b.innerText.includes('Ask to join') || b.innerText.includes('Join')
+      const btn = buttons.find(b =>
+        b.innerText.includes('Join now') ||
+        b.innerText.includes('Ask to join') ||
+        b.innerText.includes('Join')
       );
-      if (joinBtn) { joinBtn.click(); return true; }
+      if (btn) { btn.click(); return true; }
       return false;
-    });
+    }) ?? false;
   }
 
-  if (!joined) {
-    throw new Error('Could not find the Join button on the Google Meet page');
+  if (!joined) throw new Error('Could not find Join button on Google Meet page');
+
+  // --- Wait for page navigation after joining ---
+  // Google Meet navigates to a new URL/frame when entering the meeting room
+  await wait(3000);
+  try {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 });
+  } catch {
+    // Navigation may not happen if already on the right page — that's fine
   }
+  await wait(2000);
 
   // --- Wait to be admitted ---
   emitStatus(io, meetingId, 'waiting', 'Waiting to be admitted...');
 
-  // Poll for signs we are inside the meeting (video tiles, chat button, etc.)
-  const admittedSelectors = [
-    '[data-allocation-index]',  // participant tiles
-    '[aria-label="Chat with everyone"]',
-    '[jsname="A5il2e"]',        // meeting controls bar
-    '.crqnQb',                  // meeting room container
-  ];
-
   let admitted = false;
-  for (let attempt = 0; attempt < 30; attempt++) {
-    await new Promise(r => setTimeout(r, 2000));
+  for (let i = 0; i < 30; i++) {
+    await wait(2000);
+    if (page.isClosed()) break;
 
-    admitted = await page.evaluate((selectors: string[]) => {
-      return selectors.some(sel => document.querySelector(sel) !== null);
-    }, admittedSelectors);
+    admitted = await safeEval(page, () => {
+      const selectors = [
+        '[data-allocation-index]',
+        '[aria-label="Chat with everyone"]',
+        '[jsname="A5il2e"]',
+        '.crqnQb',
+      ];
+      return selectors.some(sel => !!document.querySelector(sel));
+    }) ?? false;
 
     if (admitted) break;
 
-    // Check for "denied" / "removed" state
-    const denied = await page.evaluate(() => {
-      return document.body.innerText.includes("wasn't let in") ||
-        document.body.innerText.includes('removed') ||
-        document.body.innerText.includes('denied');
-    });
-
-    if (denied) {
-      throw new Error('Bot was denied entry to the meeting');
-    }
+    const denied = await safeEval(page, () =>
+      document.body?.innerText?.includes("wasn't let in") ||
+      document.body?.innerText?.includes('denied') ||
+      false
+    );
+    if (denied) throw new Error('Bot was denied entry to the meeting');
   }
 
-  if (!admitted) {
-    throw new Error('Timed out waiting to be admitted to the meeting');
-  }
+  if (!admitted) throw new Error('Timed out waiting to be admitted to the meeting');
 
   session.startedAt = Date.now();
   emitStatus(io, meetingId, 'live', 'Bot is live in the meeting');
 
   // --- Enable Captions ---
-  await new Promise(r => setTimeout(r, 3000));
-  await enableCaptions(page);
+  await wait(3000);
+  await enableCaptions(page).catch(() => {});
 
   // --- Inject Caption Observer ---
-  await page.exposeFunction('onCaptionLine', (text: string, speaker: string) => {
-    const line: TranscriptLine = {
-      meetingId,
-      line: text,
-      speakerLabel: speaker,
-      timestamp: Date.now(),
-    };
-    session.transcriptLines.push(line);
-    io.to(meetingId).emit(SOCKET_EVENTS.TRANSCRIPT_UPDATE, line);
-  });
-
-  await injectCaptionObserver(page);
+  try {
+    await page.exposeFunction('onCaptionLine', (text: string, speaker: string) => {
+      const line: TranscriptLine = { meetingId, line: text, speakerLabel: speaker, timestamp: Date.now() };
+      session.transcriptLines.push(line);
+      io.to(meetingId).emit(SOCKET_EVENTS.TRANSCRIPT_UPDATE, line);
+    });
+    await injectCaptionObserver(page);
+  } catch (err) {
+    console.warn(`[bot:${meetingId}] Caption injection warning:`, err);
+  }
 
   // --- Poll for Meeting End ---
   session.meetingEndPoller = setInterval(async () => {
@@ -289,25 +247,19 @@ async function runBot(session: BotSession, meetUrl: string, io: SocketServer): P
       await handleMeetingEnd(session, io);
       return;
     }
-
     try {
-      const ended = await page.evaluate(() => {
-        const bodyText = document.body?.innerText || '';
-        return (
-          bodyText.includes('You left the meeting') ||
-          bodyText.includes('The meeting has ended') ||
-          bodyText.includes('Meeting ended') ||
-          bodyText.includes('Return to home screen') ||
-          document.title.toLowerCase().includes('left')
-        );
+      const ended = await safeEval(page, () => {
+        const t = document.body?.innerText || '';
+        return t.includes('You left the meeting') ||
+          t.includes('The meeting has ended') ||
+          t.includes('Meeting ended') ||
+          t.includes('Return to home screen');
       });
-
       if (ended) {
         clearInterval(session.meetingEndPoller!);
         await handleMeetingEnd(session, io);
       }
     } catch {
-      // Page may have been closed
       clearInterval(session.meetingEndPoller!);
       await handleMeetingEnd(session, io);
     }
@@ -317,7 +269,6 @@ async function runBot(session: BotSession, meetUrl: string, io: SocketServer): P
 async function handleMeetingEnd(session: BotSession, io: SocketServer): Promise<void> {
   const { meetingId } = session;
   session.endedAt = Date.now();
-  session.status = 'processing';
 
   emitStatus(io, meetingId, 'processing', 'Meeting ended — uploading transcript...');
 
@@ -325,13 +276,11 @@ async function handleMeetingEnd(session: BotSession, io: SocketServer): Promise<
     ? Math.round((session.endedAt - session.startedAt) / 1000)
     : 0;
 
-  // Upload transcript to GCP Storage
   let transcriptUrl: string | null = null;
   if (session.transcriptLines.length > 0) {
-    transcriptUrl = await uploadTranscript(meetingId, session.transcriptLines);
+    transcriptUrl = await uploadTranscript(meetingId, session.transcriptLines).catch(() => null);
   }
 
-  // Notify the Next.js web app to trigger summarization
   const webAppUrl = process.env.WEB_APP_URL;
   if (webAppUrl && session.transcriptLines.length > 0) {
     try {
@@ -341,11 +290,7 @@ async function handleMeetingEnd(session: BotSession, io: SocketServer): Promise<
           'Content-Type': 'application/json',
           'x-bot-secret': process.env.BOT_SERVICE_SECRET || '',
         },
-        body: JSON.stringify({
-          meetingId,
-          transcript: session.transcriptLines,
-          transcriptUrl,
-        }),
+        body: JSON.stringify({ meetingId, transcript: session.transcriptLines, transcriptUrl }),
       });
     } catch (err) {
       console.error(`[bot:${meetingId}] Failed to trigger summarization:`, err);
@@ -359,18 +304,14 @@ async function handleMeetingEnd(session: BotSession, io: SocketServer): Promise<
     transcriptUrl,
   });
 
-  emitStatus(io, meetingId, 'done', 'Summary generation complete');
+  emitStatus(io, meetingId, 'done');
   await cleanupSession(meetingId);
 }
 
 export async function stopBot(meetingId: string, io: SocketServer): Promise<void> {
   const session = sessions.get(meetingId);
   if (!session) throw new Error(`No active bot session for meeting ${meetingId}`);
-
-  if (session.meetingEndPoller) {
-    clearInterval(session.meetingEndPoller);
-  }
-
+  if (session.meetingEndPoller) clearInterval(session.meetingEndPoller);
   await handleMeetingEnd(session, io);
 }
 
@@ -385,18 +326,10 @@ export function getBotCaptionCount(meetingId: string): number {
 async function cleanupSession(meetingId: string): Promise<void> {
   const session = sessions.get(meetingId);
   if (!session) return;
-
   try {
-    if (session.page && !session.page.isClosed()) {
-      await session.page.close();
-    }
-    if (session.browser) {
-      await session.browser.close();
-    }
-  } catch (err) {
-    console.error(`[bot:${meetingId}] Cleanup error:`, err);
-  }
-
+    if (session.page && !session.page.isClosed()) await session.page.close();
+    if (session.browser) await session.browser.close();
+  } catch { /* ignore cleanup errors */ }
   sessions.delete(meetingId);
   console.log(`[bot:${meetingId}] Session cleaned up`);
 }
