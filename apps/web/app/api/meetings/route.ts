@@ -79,29 +79,29 @@ export async function POST(req: NextRequest) {
       updatedAt: FieldValue.serverTimestamp(),
     });
 
-    // Call bot service
+    // Call bot service — fire and don't wait (Render free tier has cold start delay)
+    // Return meetingId immediately, bot connects asynchronously
     const botServiceUrl = process.env.BOT_SERVICE_URL || 'http://localhost:3001';
     const botSecret = process.env.BOT_SERVICE_SECRET || '';
 
-    try {
-      const botRes = await fetch(`${botServiceUrl}/api/bot/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-bot-secret': botSecret },
-        body: JSON.stringify({ meetUrl, meetingId, userId: user.uid }),
-      });
-
+    // Non-blocking: don't await, just fire
+    fetch(`${botServiceUrl}/api/bot/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-bot-secret': botSecret },
+      signal: AbortSignal.timeout(25000), // 25s timeout for cold start
+      body: JSON.stringify({ meetUrl, meetingId, userId: user.uid }),
+    }).then(async (botRes) => {
       if (botRes.ok) {
         const { botId } = await botRes.json();
-        await ref.update({ botId });
+        await ref.update({ botId, status: 'joining' });
       } else {
-        console.error('[api/meetings] Bot start failed:', await botRes.text());
+        console.error('[bot] start failed:', await botRes.text());
         await ref.update({ status: 'error' });
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
-      console.error('[api/meetings] Cannot reach bot service:', msg);
-      await ref.update({ status: 'error' });
-    }
+    }).catch((err) => {
+      console.error('[bot] unreachable:', err?.message);
+      ref.update({ status: 'error' });
+    });
 
     return NextResponse.json({ meetingId, success: true });
   } catch (err: unknown) {
