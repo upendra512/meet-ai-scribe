@@ -38,10 +38,17 @@ export async function GET(req: NextRequest) {
 // POST /api/meetings — create meeting + call bot/start
 export async function POST(req: NextRequest) {
   try {
-    const user = getUserFromToken(req);
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    const body = await req.json();
+    const { meetUrl, userId: bodyUserId } = body;
 
-    const { meetUrl } = await req.json();
+    // Try JWT first, fall back to x-user-id header, then body userId
+    const jwtUser = getUserFromToken(req);
+    const uid = jwtUser?.uid
+      || req.headers.get('x-user-id')
+      || bodyUserId;
+
+    if (!uid) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    const user = { uid, email: jwtUser?.email || '' };
     if (!meetUrl) return NextResponse.json({ error: 'meetUrl is required' }, { status: 400 });
 
     const db = getAdminDb();

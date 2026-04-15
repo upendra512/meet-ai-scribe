@@ -33,14 +33,15 @@ export function MeetingForm() {
     setLoading(true);
 
     try {
-      const token = await user?.getIdToken();
+      const token = await user?.getIdToken(true).catch(() => user?.getIdToken());
       const res = await fetch('/api/meetings', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${token ?? ''}`,
+          'x-user-id': user?.uid ?? '',
         },
-        body: JSON.stringify({ meetUrl: url.trim() }),
+        body: JSON.stringify({ meetUrl: url.trim(), userId: user?.uid }),
       });
 
       const data = await res.json().catch(() => ({}));
