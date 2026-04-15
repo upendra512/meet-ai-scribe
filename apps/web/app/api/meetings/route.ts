@@ -1,112 +1,124 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAdminDb } from '@/lib/firebase-admin';
-import { FieldValue } from 'firebase-admin/firestore';
+import { initializeApp, getApps, cert } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 
-// Decode Firebase JWT without verifying signature (hackathon-safe: client already verified by Firebase client SDK)
+// Decode Firebase JWT without verifying (client already verified by Firebase Auth)
 function getUserFromToken(req: NextRequest): { uid: string; email: string } | null {
   const auth = req.headers.get('Authorization');
+  const xUid = req.headers.get('x-user-id');
+
+  if (xUid) return { uid: xUid, email: '' };
+
   if (!auth?.startsWith('Bearer ')) return null;
   const token = auth.slice(7);
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
     const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    if (!payload.user_id && !payload.sub) return null;
     return { uid: payload.user_id || payload.sub, email: payload.email || '' };
   } catch {
     return null;
   }
 }
 
-// GET /api/meetings — list user's meetings
+function getDb() {
+  if (getApps().length > 0) return getFirestore(getApps()[0]);
+
+  const rawKey = process.env.FIREBASE_ADMIN_PRIVATE_KEY ?? '';
+  const privateKey = rawKey.includes('BEGIN PRIVATE KEY')
+    ? rawKey.replace(/\\n/g, '\n')
+    : Buffer.from(rawKey, 'base64').toString('utf8');
+
+  const app = initializeApp({
+    credential: cert({
+      projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!,
+      clientEmail: process.env.FIREBASE_ADMIN_CLIENT_EMAIL!,
+      privateKey,
+    }),
+  });
+  return getFirestore(app);
+}
+
 export async function GET(req: NextRequest) {
   const user = getUserFromToken(req);
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-
-  const db = getAdminDb();
-  const snap = await db
-    .collection('meetings')
-    .where('userId', '==', user.uid)
-    .orderBy('createdAt', 'desc')
-    .limit(50)
-    .get();
-
-  const meetings = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  return NextResponse.json({ meetings });
+  try {
+    const db = getDb();
+    const snap = await db.collection('meetings')
+      .where('userId', '==', user.uid)
+      .orderBy('createdAt', 'desc')
+      .limit(50).get();
+    const meetings = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    return NextResponse.json({ meetings });
+  } catch (e: unknown) {
+    return NextResponse.json({ error: String(e) }, { status: 500 });
+  }
 }
 
-// POST /api/meetings — create meeting + call bot/start
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const { meetUrl, userId: bodyUserId } = body;
 
-    // Try JWT first, fall back to x-user-id header, then body userId
     const jwtUser = getUserFromToken(req);
-    const uid = jwtUser?.uid
-      || req.headers.get('x-user-id')
-      || bodyUserId;
-
+    const uid = jwtUser?.uid || req.headers.get('x-user-id') || bodyUserId;
     if (!uid) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    const user = { uid, email: jwtUser?.email || '' };
     if (!meetUrl) return NextResponse.json({ error: 'meetUrl is required' }, { status: 400 });
 
-    const db = getAdminDb();
+    // Write to Firestore via REST (no Admin SDK private key needed)
+    const projectId = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!;
+    const meetingId = `meeting_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const title = `Meeting · ${new Date().toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
+      month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit',
     })}`;
 
-    const ref = db.collection('meetings').doc();
-    const meetingId = ref.id;
+    const firestoreUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/meetings/${meetingId}?key=${process.env.NEXT_PUBLIC_FIREBASE_API_KEY}`;
 
-    await ref.set({
-      userId: user.uid,
-      meetUrl,
-      title,
-      status: 'joining',
-      botId: null,
-      startedAt: null,
-      endedAt: null,
-      duration: null,
-      transcriptLines: 0,
-      transcriptUrl: null,
-      summary: null,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
+    const firestoreRes = await fetch(firestoreUrl, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fields: {
+          userId: { stringValue: uid },
+          meetUrl: { stringValue: meetUrl },
+          title: { stringValue: title },
+          status: { stringValue: 'joining' },
+          transcriptLines: { integerValue: 0 },
+          transcriptUrl: { nullValue: null },
+          summary: { nullValue: null },
+          botId: { nullValue: null },
+          startedAt: { nullValue: null },
+          endedAt: { nullValue: null },
+          duration: { nullValue: null },
+          createdAt: { stringValue: new Date().toISOString() },
+          updatedAt: { stringValue: new Date().toISOString() },
+        },
+      }),
     });
 
-    // Call bot service — fire and don't wait (Render free tier has cold start delay)
-    // Return meetingId immediately, bot connects asynchronously
+    if (!firestoreRes.ok) {
+      const err = await firestoreRes.text();
+      console.error('[firestore] write failed:', err);
+      return NextResponse.json({ error: 'Failed to create meeting record' }, { status: 500 });
+    }
+
+    // Fire-and-forget bot call
     const botServiceUrl = process.env.BOT_SERVICE_URL || 'http://localhost:3001';
     const botSecret = process.env.BOT_SERVICE_SECRET || '';
 
-    // Non-blocking: don't await, just fire
     fetch(`${botServiceUrl}/api/bot/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-bot-secret': botSecret },
-      signal: AbortSignal.timeout(25000), // 25s timeout for cold start
-      body: JSON.stringify({ meetUrl, meetingId, userId: user.uid }),
-    }).then(async (botRes) => {
-      if (botRes.ok) {
-        const { botId } = await botRes.json();
-        await ref.update({ botId, status: 'joining' });
-      } else {
-        console.error('[bot] start failed:', await botRes.text());
-        await ref.update({ status: 'error' });
-      }
-    }).catch((err) => {
-      console.error('[bot] unreachable:', err?.message);
-      ref.update({ status: 'error' });
-    });
+      signal: AbortSignal.timeout(25000),
+      body: JSON.stringify({ meetUrl, meetingId, userId: uid }),
+    }).then(async (r) => {
+      if (!r.ok) console.error('[bot] failed:', await r.text());
+    }).catch((e) => console.error('[bot] unreachable:', e?.message));
 
     return NextResponse.json({ meetingId, success: true });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error('[api/meetings] Unhandled error:', msg);
+    console.error('[api/meetings] error:', msg);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
